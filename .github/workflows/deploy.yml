@@ -26,26 +26,36 @@ jobs:
         id: deploy
         env:
           VERCEL_TOKEN: ${{ secrets.VERCEL_TOKEN }}
+        continue-on-error: true
         run: |
-          set -eo pipefail
-          echo "=== vercel --version ==="
           vercel --version
-          echo "=== deploy attempt ==="
-          OUT=$(vercel deploy --prod --yes --token="$VERCEL_TOKEN" 2>&1)
+          set +e
+          vercel deploy --prod --yes --token="$VERCEL_TOKEN" > /tmp/vercel.log 2>&1
           EXIT=$?
-          echo "$OUT"
-          echo "=== exit: $EXIT ==="
-          URL=$(echo "$OUT" | grep -oE 'https://[a-z0-9.-]+\.vercel\.app' | tail -n 1)
+          set -e
+          echo "exit=$EXIT" >> "$GITHUB_OUTPUT"
+          URL=$(grep -oE 'https://[a-z0-9.-]+\.vercel\.app' /tmp/vercel.log | tail -n 1)
           echo "url=$URL" >> "$GITHUB_OUTPUT"
-          {
-            echo "### 🚀 Deploy result"
-            echo ""
-            echo "**URL:** $URL"
-            echo ""
-            echo '```'
-            echo "$OUT"
-            echo '```'
-          } >> "$GITHUB_STEP_SUMMARY"
+          cat /tmp/vercel.log
 
-      - name: Print URL
-        run: echo "${{ steps.deploy.outputs.url }}"
+      - name: Upload deploy log
+        uses: actions/upload-artifact@v4
+        with:
+          name: vercel-deploy-log
+          path: /tmp/vercel.log
+          retention-days: 7
+
+      - name: Comment result on commit
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          EXIT="${{ steps.deploy.outputs.exit }}"
+          URL="${{ steps.deploy.outputs.url }}"
+          LOG=$(tail -c 5000 /tmp/vercel.log | sed 's/"/\\"/g' | awk '{printf "%s\\n",$0}')
+          BODY="Vercel deploy exit=$EXIT  URL=$URL  ---  $LOG"
+          gh api "repos/${{ github.repository }}/commits/${{ github.sha }}/comments" \
+            -f body="$BODY"
+
+      - name: Fail if deploy failed
+        if: steps.deploy.outputs.exit != '0'
+        run: exit 1
