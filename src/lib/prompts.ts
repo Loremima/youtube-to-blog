@@ -53,14 +53,16 @@ Write the article now. Return ONLY the HTML.`;
 
 export function htmlToMarkdown(html: string): string {
   let md = html;
+  // Inline transforms first so nested markers survive block stripTags.
+  md = md.replace(/<a[^>]*href="([^"]+)"[^>]*>([\s\S]*?)<\/a>/gi, (_m, href, t) => `[${stripTags(t)}](${href})`);
+  md = md.replace(/<strong[^>]*>([\s\S]*?)<\/strong>/gi, (_m, t) => `**${stripTags(t)}**`);
+  md = md.replace(/<em[^>]*>([\s\S]*?)<\/em>/gi, (_m, t) => `*${stripTags(t)}*`);
+  // Block transforms.
   md = md.replace(/<h1[^>]*>([\s\S]*?)<\/h1>/gi, (_m, t) => `\n# ${stripTags(t)}\n\n`);
   md = md.replace(/<h2[^>]*>([\s\S]*?)<\/h2>/gi, (_m, t) => `\n## ${stripTags(t)}\n\n`);
   md = md.replace(/<h3[^>]*>([\s\S]*?)<\/h3>/gi, (_m, t) => `\n### ${stripTags(t)}\n\n`);
-  md = md.replace(/<p[^>]*>([\s\S]*?)<\/p>/gi, (_m, t) => `${stripTags(t)}\n\n`);
-  md = md.replace(/<strong[^>]*>([\s\S]*?)<\/strong>/gi, (_m, t) => `**${stripTags(t)}**`);
-  md = md.replace(/<em[^>]*>([\s\S]*?)<\/em>/gi, (_m, t) => `*${stripTags(t)}*`);
-  md = md.replace(/<a[^>]*href="([^"]+)"[^>]*>([\s\S]*?)<\/a>/gi, (_m, href, t) => `[${stripTags(t)}](${href})`);
   md = md.replace(/<li[^>]*>([\s\S]*?)<\/li>/gi, (_m, t) => `- ${stripTags(t)}\n`);
+  md = md.replace(/<p[^>]*>([\s\S]*?)<\/p>/gi, (_m, t) => `${stripTags(t)}\n\n`);
   md = md.replace(/<\/?(ul|ol|blockquote)[^>]*>/gi, "\n");
   md = md.replace(/<br\s*\/?\s*>/gi, "\n");
   md = md.replace(/<[^>]+>/g, "");

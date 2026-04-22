@@ -41,10 +41,11 @@ export async function POST(req: Request) {
 
     const body = CreateBody.parse(await req.json());
 
-    const [{ value: existing }] = await db
+    const rows = await db
       .select({ value: count() })
       .from(styleProfiles)
       .where(eq(styleProfiles.userId, session.user.id));
+    const existing = rows[0]?.value ?? 0;
     const maxProfiles = PLAN_LIMITS[session.user.plan].maxStyleProfiles;
     if (existing >= maxProfiles) {
       return NextResponse.json(
