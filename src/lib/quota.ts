@@ -26,11 +26,6 @@ export async function checkQuota(
   const { start, end } = currentPeriod(now);
   const limits = PLAN_LIMITS[plan];
 
-  if (!limits.apiAccess && plan === "free") {
-    // Free plan has no API access — this throws before reaching /api/generate
-    // via an external flag check if needed. Kept here to keep policy in one place.
-  }
-
   const [row] = await db
     .select({ count: sql<number>`count(*)::int` })
     .from(usageLogs)
