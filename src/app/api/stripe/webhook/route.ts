@@ -1,6 +1,6 @@
 import { NextResponse } from "next/server";
 import type Stripe from "stripe";
-import { eq } from "drizzle-orm";
+import { and, eq, isNull } from "drizzle-orm";
 import { db, users, apiKeys, keyReveals } from "@/db";
 import { getStripe } from "@/lib/stripe";
 import { planFromPriceId } from "@/lib/plans";
@@ -102,6 +102,23 @@ async function handleCheckoutCompleted(
         planPeriodEnd: periodEnd,
       })
       .where(eq(users.id, existing.id));
+
+    const [activeKey] = await db
+      .select({ id: apiKeys.id })
+      .from(apiKeys)
+      .where(and(eq(apiKeys.userId, existing.id), isNull(apiKeys.revokedAt)))
+      .limit(1);
+    if (!activeKey) {
+      const apiKey = generateApiKey();
+      await db.insert(apiKeys).values({
+        id: newId("key"),
+        userId,
+        keyHash: apiKey.hash,
+        keyPrefix: apiKey.prefix,
+        label: "default",
+      });
+      plaintextForReveal = apiKey.plaintext;
+    }
   } else {
     userId = newId("usr");
     await db.insert(users).values({
