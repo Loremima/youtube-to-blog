@@ -8,7 +8,7 @@ import { countWords, htmlToMarkdown } from "@/lib/prompts";
 import { handleUnknownError } from "@/lib/errors";
 import { newId } from "@/lib/ids";
 import { authenticate } from "@/lib/auth";
-import { checkQuota } from "@/lib/quota";
+import { checkQuota, enforceApiAccess } from "@/lib/quota";
 
 export const runtime = "nodejs";
 export const maxDuration = 60;
@@ -29,6 +29,7 @@ export async function POST(req: Request) {
     const auth = await authenticate(req);
     userId = auth.userId;
     apiKeyId = auth.apiKeyId;
+    enforceApiAccess(auth.plan);
 
     const quota = await checkQuota(auth.userId, auth.plan);
     if (!quota.ok) {
