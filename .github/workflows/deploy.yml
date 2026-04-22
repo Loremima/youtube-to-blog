@@ -51,10 +51,19 @@ jobs:
         run: |
           EXIT="${{ steps.deploy.outputs.exit }}"
           URL="${{ steps.deploy.outputs.url }}"
-          LOG=$(tail -c 5000 /tmp/vercel.log | sed 's/"/\\"/g' | awk '{printf "%s\\n",$0}')
-          BODY="Vercel deploy exit=$EXIT  URL=$URL  ---  $LOG"
+          {
+            echo "## Vercel deploy"
+            echo ""
+            echo "- exit: \`$EXIT\`"
+            echo "- url: \`$URL\`"
+            echo ""
+            echo '```'
+            tail -c 3500 /tmp/vercel.log
+            echo '```'
+          } > /tmp/comment.md
+          jq -Rs '{ body: . }' < /tmp/comment.md > /tmp/comment.json
           gh api "repos/${{ github.repository }}/commits/${{ github.sha }}/comments" \
-            -f body="$BODY"
+            --input /tmp/comment.json
 
       - name: Fail if deploy failed
         if: steps.deploy.outputs.exit != '0'
