@@ -72,6 +72,18 @@ export const styleProfiles = pgTable(
   }),
 );
 
+export const keyReveals = pgTable("key_reveals", {
+  sessionId: text("session_id").primaryKey(),
+  userId: text("user_id")
+    .notNull()
+    .references(() => users.id, { onDelete: "cascade" }),
+  plaintext: text("plaintext").notNull(),
+  expiresAt: timestamp("expires_at", { withTimezone: true }).notNull(),
+  createdAt: timestamp("created_at", { withTimezone: true })
+    .notNull()
+    .defaultNow(),
+});
+
 export const usageLogs = pgTable(
   "usage_logs",
   {
@@ -104,4 +116,5 @@ export type User = typeof users.$inferSelect;
 export type ApiKey = typeof apiKeys.$inferSelect;
 export type StyleProfile = typeof styleProfiles.$inferSelect;
 export type UsageLog = typeof usageLogs.$inferSelect;
+export type KeyReveal = typeof keyReveals.$inferSelect;
 export type Plan = (typeof planEnum.enumValues)[number];

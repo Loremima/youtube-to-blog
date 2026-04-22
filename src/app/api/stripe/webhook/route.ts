@@ -1,7 +1,7 @@
 import { NextResponse } from "next/server";
 import type Stripe from "stripe";
 import { eq } from "drizzle-orm";
-import { db, users, apiKeys } from "@/db";
+import { db, users, apiKeys, keyReveals } from "@/db";
 import { getStripe } from "@/lib/stripe";
 import { planFromPriceId } from "@/lib/plans";
 import { generateApiKey, newId } from "@/lib/ids";
@@ -88,7 +88,11 @@ async function handleCheckoutCompleted(
 
   const [existing] = await db.select().from(users).where(eq(users.email, email));
 
+  let userId: string;
+  let plaintextForReveal: string | null = null;
+
   if (existing) {
+    userId = existing.id;
     await db
       .update(users)
       .set({
@@ -99,7 +103,7 @@ async function handleCheckoutCompleted(
       })
       .where(eq(users.id, existing.id));
   } else {
-    const userId = newId("usr");
+    userId = newId("usr");
     await db.insert(users).values({
       id: userId,
       email,
@@ -115,6 +119,17 @@ async function handleCheckoutCompleted(
       keyHash: apiKey.hash,
       keyPrefix: apiKey.prefix,
       label: "default",
+    });
+    plaintextForReveal = apiKey.plaintext;
+  }
+
+  if (plaintextForReveal) {
+    const expiresAt = new Date(Date.now() + 1000 * 60 * 30);
+    await db.insert(keyReveals).values({
+      sessionId: session.id,
+      userId,
+      plaintext: plaintextForReveal,
+      expiresAt,
     });
   }
 }
