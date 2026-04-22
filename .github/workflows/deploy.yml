@@ -9,6 +9,10 @@ concurrency:
   group: vercel-deploy
   cancel-in-progress: false
 
+permissions:
+  contents: write
+  pull-requests: write
+
 jobs:
   deploy:
     runs-on: ubuntu-latest
