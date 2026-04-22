@@ -79,6 +79,58 @@ See `.env.example`. Required in production:
 - `STRIPE_PRICE_SOLO`, `STRIPE_PRICE_CREATOR` — product price IDs
 - `NEXT_PUBLIC_APP_URL` — public URL (e.g. `https://yt2blog.vercel.app`)
 
+## Stripe setup
+
+The app needs two recurring prices (Solo $9/mo, Creator $19/mo) and one
+webhook endpoint. Using the Stripe CLI in test mode:
+
+```bash
+# Products + prices
+stripe products create --name "YouTube-to-Blog — Solo"
+stripe prices create --product prod_... \
+  --unit-amount 900 --currency usd --recurring interval=month
+
+stripe products create --name "YouTube-to-Blog — Creator"
+stripe prices create --product prod_... \
+  --unit-amount 1900 --currency usd --recurring interval=month
+
+# Webhook (listens to the events the app handles)
+stripe webhook_endpoints create \
+  --url "https://<app>/api/stripe/webhook" \
+  --enabled-events checkout.session.completed \
+  --enabled-events customer.subscription.created \
+  --enabled-events customer.subscription.updated \
+  --enabled-events customer.subscription.deleted
+```
+
+Copy the `price_...` ids into `STRIPE_PRICE_SOLO` / `STRIPE_PRICE_CREATOR`
+and the webhook signing secret into `STRIPE_WEBHOOK_SECRET`.
+
+## Style profile shape
+
+```json
+{
+  "name": "My tech blog",
+  "tone": "friendly but rigorous, short sentences, active voice",
+  "sections_template": ["Introduction", "Key Takeaways", "Deep Dive", "CTA"],
+  "cta_text": "Subscribe at example.com for weekly deep dives.",
+  "keywords_seo": ["machine learning", "llms"],
+  "target_word_count": 900
+}
+```
+
+The generator enforces one `<h2>` per section in the order you define,
+injects the CTA as the final `<p>`, and weaves the SEO keywords into the
+body naturally.
+
+## Deploy
+
+Every push to `main` triggers `.github/workflows/deploy.yml`, which runs
+`vercel deploy --prod`, smoke-tests the root, `/login`, and
+`POST /api/generate` (unauthenticated, expects `401`), then posts the
+deploy URL + smoke table as a commit comment. Set `VERCEL_TOKEN` in repo
+secrets; everything else is pulled from Vercel project env.
+
 ## License
 
 MIT
