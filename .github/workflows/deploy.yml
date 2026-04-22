@@ -49,20 +49,79 @@ jobs:
           path: /tmp/vercel.log
           retention-days: 7
 
+      - name: Smoke test
+        id: smoke
+        if: steps.deploy.outputs.exit == '0' && steps.deploy.outputs.url != ''
+        env:
+          URL: ${{ steps.deploy.outputs.url }}
+        run: |
+          set +e
+          sleep 5
+          echo "=== GET / ==="
+          HOME_CODE=$(curl -s -o /tmp/home.html -w "%{http_code}" "$URL/")
+          HOME_SIZE=$(wc -c < /tmp/home.html)
+          echo "home: HTTP $HOME_CODE ($HOME_SIZE bytes)"
+
+          echo "=== GET /login ==="
+          LOGIN_CODE=$(curl -s -o /dev/null -w "%{http_code}" "$URL/login")
+          echo "login: HTTP $LOGIN_CODE"
+
+          echo "=== POST /api/generate (no auth → expect 401) ==="
+          GEN_CODE=$(curl -s -o /dev/null -w "%{http_code}" -X POST "$URL/api/generate" \
+            -H "Content-Type: application/json" -d '{"youtube_url":"x"}')
+          echo "generate: HTTP $GEN_CODE"
+
+          {
+            echo "home=$HOME_CODE"
+            echo "login=$LOGIN_CODE"
+            echo "generate=$GEN_CODE"
+          } >> "$GITHUB_OUTPUT"
+
+          FAIL=0
+          [ "$HOME_CODE" = "200" ]  || { echo "::warning::home not 200"; FAIL=1; }
+          [ "$LOGIN_CODE" = "200" ] || { echo "::warning::login not 200"; FAIL=1; }
+          [ "$GEN_CODE" = "401" ]   || { echo "::warning::generate not 401"; FAIL=1; }
+          echo "fail=$FAIL" >> "$GITHUB_OUTPUT"
+          exit 0
+
       - name: Comment result on commit
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           EXIT="${{ steps.deploy.outputs.exit }}"
           URL="${{ steps.deploy.outputs.url }}"
+          HOME="${{ steps.smoke.outputs.home }}"
+          LOGIN="${{ steps.smoke.outputs.login }}"
+          GEN="${{ steps.smoke.outputs.generate }}"
+          SMOKE_FAIL="${{ steps.smoke.outputs.fail }}"
           {
             echo "## Vercel deploy"
             echo ""
             echo "- exit: \`$EXIT\`"
-            echo "- url: \`$URL\`"
+            echo "- url: $URL"
             echo ""
+            echo "### Smoke test"
+            if [ -z "$HOME" ]; then
+              echo "_Skipped (deploy failed)._"
+            else
+              echo ""
+              echo "| Route | Expected | Got |"
+              echo "|---|---|---|"
+              echo "| GET / | 200 | $HOME |"
+              echo "| GET /login | 200 | $LOGIN |"
+              echo "| POST /api/generate (no auth) | 401 | $GEN |"
+              if [ "$SMOKE_FAIL" = "0" ]; then
+                echo ""
+                echo "**All smoke checks passed.**"
+              else
+                echo ""
+                echo "**One or more routes returned an unexpected status.**"
+              fi
+            fi
+            echo ""
+            echo "### Deploy log (tail)"
             echo '```'
-            tail -c 3500 /tmp/vercel.log
+            tail -c 3000 /tmp/vercel.log
             echo '```'
           } > /tmp/comment.md
           jq -Rs '{ body: . }' < /tmp/comment.md > /tmp/comment.json
