@@ -202,28 +202,66 @@ jobs:
             ENV_JSON=$(curl -sS -H "Authorization: Bearer $VERCEL_TOKEN" \
               "https://api.vercel.com/v10/projects/$PROJ_ID/env?teamId=$TEAM_ID&decrypt=true")
             HAS_ENVS=$(echo "$ENV_JSON" | jq -r '(.envs // []) | length' 2>/dev/null)
-            diag "scoped by-id envs returned: ${HAS_ENVS:-<err>}"
-            if [ "${HAS_ENVS:-0}" = "0" ]; then
-              diag "raw response (first 400):"
-              echo "$ENV_JSON" | head -c 400 | tee -a /tmp/diag/pull.log
-              echo | tee -a /tmp/diag/pull.log
+            diag "user-defined envs returned: ${HAS_ENVS:-<err>}"
+            diag "--- all keys + targets ---"
+            echo "$ENV_JSON" | jq -r '.envs[]? | "\(.key) [\(.target|join(","))]"' \
+              | tee -a /tmp/diag/pull.log
+          fi
+
+          # Vercel Postgres / Neon integration does not expose POSTGRES_URL via
+          # /projects/{id}/env; it is injected at runtime from a connected store.
+          # Fetch the connection string from /v1/storage/stores.
+          if [ -n "$PROJ_ID" ] && ! echo "$ENV_JSON" | jq -e '.envs[]? | select(.key=="POSTGRES_URL")' >/dev/null 2>&1; then
+            diag "=== resolve connected storage store (POSTGRES_URL integration) ==="
+            STORES_JSON=$(curl -sS -H "Authorization: Bearer $VERCEL_TOKEN" \
+              "https://api.vercel.com/v1/storage/stores?teamId=$TEAM_ID&projectId=$PROJ_ID")
+            diag "stores payload (first 600 chars):"
+            echo "$STORES_JSON" | head -c 600 | tee -a /tmp/diag/pull.log
+            echo | tee -a /tmp/diag/pull.log
+            STORE_ID=$(echo "$STORES_JSON" | jq -r '.stores[]? | select(.type=="postgres" or .type=="neon") | .id' | head -1)
+            diag "store id: ${STORE_ID:-<none>}"
+            if [ -n "$STORE_ID" ]; then
+              STORE_JSON=$(curl -sS -H "Authorization: Bearer $VERCEL_TOKEN" \
+                "https://api.vercel.com/v1/storage/stores/$STORE_ID?teamId=$TEAM_ID")
+              diag "store detail keys:"
+              echo "$STORE_JSON" | jq -r 'keys | join(",")' | tee -a /tmp/diag/pull.log
+              POSTGRES_URL_VALUE=$(echo "$STORE_JSON" | jq -r '
+                .connectionStrings?.postgres_url
+                // .store.connectionStrings?.postgres_url
+                // .urls?.postgres_url
+                // .envs?.POSTGRES_URL
+                // empty
+              ')
+              if [ -n "$POSTGRES_URL_VALUE" ]; then
+                diag "POSTGRES_URL resolved from store (length=${#POSTGRES_URL_VALUE})"
+                # Prepend to the downstream env script; user-defined envs are
+                # appended below.
+                echo "export POSTGRES_URL=$(printf '%s' "$POSTGRES_URL_VALUE" | jq -R .)" > /tmp/e2e-env-store.sh
+              else
+                diag "store did not expose a direct POSTGRES_URL; full payload follows:"
+                echo "$STORE_JSON" | head -c 1200 | tee -a /tmp/diag/pull.log
+                echo | tee -a /tmp/diag/pull.log
+              fi
             fi
           fi
 
-          # Extract production-scoped env vars into an export script.
+          # Build /tmp/e2e-env.sh: POSTGRES_URL from integration store (if any)
+          # prepended, followed by user-defined production env vars.
+          : > /tmp/e2e-env.sh
+          [ -f /tmp/e2e-env-store.sh ] && cat /tmp/e2e-env-store.sh >> /tmp/e2e-env.sh
           echo "$ENV_JSON" | jq -r '
             .envs[]?
             | select(.target|type=="array" and any(.=="production"))
             | select(.value != null)
             | "export \(.key)=\((.value|tostring)|@json)"
-          ' > /tmp/e2e-env.sh
+          ' >> /tmp/e2e-env.sh
 
           diag "=== keys loaded (values redacted) ==="
           grep -oE '^export [A-Z_][A-Z0-9_]*' /tmp/e2e-env.sh | sed 's/^export /- /' \
             | tee -a /tmp/diag/pull.log
 
           if ! grep -q '^export POSTGRES_URL=' /tmp/e2e-env.sh; then
-            diag "!! POSTGRES_URL not present in production env"
+            diag "!! POSTGRES_URL not present — neither user-defined nor resolvable via storage API"
             exit 1
           fi
           exit 0
