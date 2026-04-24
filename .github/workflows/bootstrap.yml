@@ -103,6 +103,41 @@ jobs:
             | jq -r '.[]? | "\(.id) \(.slug) \(.type) \(.installType // "-")"' \
             | tee -a /tmp/diag/pg.log
 
+          # 3) Last attempt — drive the Vercel CLI which wraps the modern
+          #    Marketplace flow. With a token + non-interactive flags it can
+          #    sometimes provision Postgres without OAuth.
+          log "=== attempting via Vercel CLI ==="
+          npm install --global vercel@latest >/dev/null 2>&1
+          vercel --version | tee -a /tmp/diag/pg.log
+
+          mkdir -p .vercel
+          cat > .vercel/project.json <<EOF
+          {"orgId":"$TEAM_ID","projectId":"$PROJ_ID"}
+          EOF
+
+          log "vercel storage --help"
+          vercel storage --help 2>&1 | tee -a /tmp/diag/pg.log | head -40
+
+          log "vercel storage create yt2blog-db (postgres)"
+          # Try multiple syntaxes — different Vercel CLI majors expose different
+          # subcommands.
+          for cmd in \
+            "vercel storage add postgres --name yt2blog-db --token=$VERCEL_TOKEN --yes" \
+            "vercel storage create postgres yt2blog-db --token=$VERCEL_TOKEN --yes" \
+            "vercel storage create --type postgres --name yt2blog-db --token=$VERCEL_TOKEN --yes"; do
+            log "trying: ${cmd//$VERCEL_TOKEN/<redacted>}"
+            $cmd 2>&1 | tee -a /tmp/diag/pg.log
+            sleep 2
+            existing=$(curl -sS -H "Authorization: Bearer $VERCEL_TOKEN" \
+              "https://api.vercel.com/v1/storage/stores?teamId=$TEAM_ID&projectId=$PROJ_ID" \
+              | jq -r '.stores[]? | select(.type|test("postgres|neon"; "i")) | .id' | head -1)
+            if [ -n "$existing" ]; then
+              log "store now linked: $existing"
+              echo "store_id=$existing" >> "$GITHUB_OUTPUT"
+              exit 0
+            fi
+          done
+
           log "=== falling back: bootstrap cannot auto-provision on this API surface ==="
           echo "store_id=" >> "$GITHUB_OUTPUT"
           exit 1
