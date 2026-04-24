@@ -185,18 +185,30 @@ jobs:
             curl -sS -H "Authorization: Bearer $VERCEL_TOKEN" "$url"
           }
 
+          diag "=== resolve project id ==="
+          PROJ_JSON=$(curl -sS -H "Authorization: Bearer $VERCEL_TOKEN" \
+            "https://api.vercel.com/v9/projects/youtube-to-blog?teamId=$TEAM_ID")
+          PROJ_ID=$(echo "$PROJ_JSON" | jq -r '.id // empty')
+          diag "project id: ${PROJ_ID:-<not found>}"
+          if [ -z "$PROJ_ID" ]; then
+            diag "raw project response (first 400):"
+            echo "$PROJ_JSON" | head -c 400 | tee -a /tmp/diag/pull.log
+            echo | tee -a /tmp/diag/pull.log
+          fi
+
           ENV_JSON=""
-          if [ -n "$TEAM_ID" ]; then
-            ENV_JSON=$(fetch_env "https://api.vercel.com/v10/projects/youtube-to-blog/env?teamId=$TEAM_ID&decrypt=true")
+          HAS_ENVS=""
+          if [ -n "$PROJ_ID" ]; then
+            ENV_JSON=$(curl -sS -H "Authorization: Bearer $VERCEL_TOKEN" \
+              "https://api.vercel.com/v10/projects/$PROJ_ID/env?teamId=$TEAM_ID&decrypt=true")
             HAS_ENVS=$(echo "$ENV_JSON" | jq -r '(.envs // []) | length' 2>/dev/null)
-            diag "scoped envs returned: ${HAS_ENVS:-<err>}"
+            diag "scoped by-id envs returned: ${HAS_ENVS:-<err>}"
+            if [ "${HAS_ENVS:-0}" = "0" ]; then
+              diag "raw response (first 400):"
+              echo "$ENV_JSON" | head -c 400 | tee -a /tmp/diag/pull.log
+              echo | tee -a /tmp/diag/pull.log
+            fi
           fi
-          if [ -z "${HAS_ENVS:-}" ] || [ "${HAS_ENVS:-0}" = "0" ]; then
-            ENV_JSON=$(fetch_env "https://api.vercel.com/v10/projects/youtube-to-blog/env?decrypt=true")
-            HAS_ENVS=$(echo "$ENV_JSON" | jq -r '(.envs // []) | length' 2>/dev/null)
-            diag "unscoped envs returned: ${HAS_ENVS:-<err>}"
-          fi
-          echo "$ENV_JSON" | jq -r '.error // empty' | tee -a /tmp/diag/pull.log
 
           # Extract production-scoped env vars into an export script.
           echo "$ENV_JSON" | jq -r '
