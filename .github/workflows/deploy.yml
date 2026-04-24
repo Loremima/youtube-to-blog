@@ -163,17 +163,51 @@ jobs:
         run: |
           set -e
           vercel link --yes --project youtube-to-blog --token="$VERCEL_TOKEN"
+          echo "---linked project---"
+          cat .vercel/project.json || echo "no .vercel/project.json"
           vercel env pull .env.e2e --environment=production --token="$VERCEL_TOKEN"
-          grep -E '^(POSTGRES_URL|POSTGRES_PRISMA_URL|POSTGRES_URL_NON_POOLING)=' .env.e2e \
-            | sed 's/=.*/=<redacted>/'
+          echo "---.env.e2e keys (values redacted)---"
+          if [ -f .env.e2e ]; then
+            awk -F= '/^[A-Z_]+=/{print $1"=<redacted>"}' .env.e2e
+          else
+            echo "!! .env.e2e missing" && exit 1
+          fi
+          if ! grep -q '^POSTGRES_URL=' .env.e2e; then
+            echo "!! POSTGRES_URL not found in .env.e2e" && exit 1
+          fi
 
       - name: Run live AC validation (AC1/AC2/AC3/AC4)
         id: e2e
+        env:
+          # Read the .env.e2e via a small bootstrap inside the run: block so
+          # quoted values with special characters survive unchanged.
+          DEPLOY_URL: ${{ needs.deploy.outputs.url }}
         run: |
-          set -a
+          set -euo pipefail
+          node -e '
+            const fs = require("node:fs");
+            const text = fs.readFileSync(".env.e2e","utf8");
+            const lines = text.split(/\r?\n/);
+            const out = {};
+            for (const line of lines) {
+              const m = line.match(/^([A-Z_][A-Z0-9_]*)=(.*)$/);
+              if (!m) continue;
+              let v = m[2];
+              if (v.startsWith("\"") && v.endsWith("\"")) v = v.slice(1,-1);
+              out[m[1]] = v;
+            }
+            const keep = ["POSTGRES_URL","POSTGRES_PRISMA_URL","POSTGRES_URL_NON_POOLING","TRANSCRIPTAPI_KEY","ANTHROPIC_API_KEY"];
+            const exportLines = Object.entries(out)
+              .filter(([k])=>keep.includes(k))
+              .map(([k,v])=>`export ${k}=${JSON.stringify(v)}`)
+              .join("\n");
+            fs.writeFileSync("/tmp/e2e-env.sh", exportLines+"\n");
+            console.log("exports:", Object.keys(out).filter(k=>keep.includes(k)).join(","));
+          '
           # shellcheck disable=SC1091
-          source .env.e2e
-          set +a
+          source /tmp/e2e-env.sh
+          : "${POSTGRES_URL:?POSTGRES_URL missing after load}"
+          echo "POSTGRES_URL loaded (length=${#POSTGRES_URL})"
           npx tsx tests/e2e/live.ts 2>&1 | tee /tmp/e2e.log
         continue-on-error: true
 
