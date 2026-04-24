@@ -155,55 +155,73 @@ jobs:
       - name: Install dependencies
         run: npm ci
 
-      - name: Install Vercel CLI
-        run: npm install --global vercel@latest
-
-      - name: Pull production env from Vercel
+      - name: Pull production env from Vercel (REST API)
         id: pull_env
         run: |
-          set -e
-          vercel link --yes --project youtube-to-blog --token="$VERCEL_TOKEN"
-          echo "---linked project---"
-          cat .vercel/project.json || echo "no .vercel/project.json"
-          vercel env pull .env.e2e --environment=production --token="$VERCEL_TOKEN"
-          echo "---.env.e2e keys (values redacted)---"
-          if [ -f .env.e2e ]; then
-            awk -F= '/^[A-Z_]+=/{print $1"=<redacted>"}' .env.e2e
-          else
-            echo "!! .env.e2e missing" && exit 1
+          set +e
+          mkdir -p /tmp/diag
+          : > /tmp/diag/pull.log
+
+          diag() { echo "$@" | tee -a /tmp/diag/pull.log; }
+
+          diag "=== whoami ==="
+          curl -sS -H "Authorization: Bearer $VERCEL_TOKEN" \
+            https://api.vercel.com/v2/user \
+            | jq -r '{username: .user.username, defaultTeamId: .user.defaultTeamId}' \
+            | tee -a /tmp/diag/pull.log
+
+          diag "=== list teams ==="
+          TEAMS_JSON=$(curl -sS -H "Authorization: Bearer $VERCEL_TOKEN" \
+            https://api.vercel.com/v2/teams)
+          echo "$TEAMS_JSON" | jq -r '.teams[]? | "\(.id) \(.slug)"' \
+            | tee -a /tmp/diag/pull.log
+          TEAM_ID=$(echo "$TEAMS_JSON" | jq -r '.teams[]? | select(.slug=="loremimas-projects") | .id' | head -1)
+          diag "resolved team id: ${TEAM_ID:-<personal scope>}"
+
+          # Try the project env endpoint, scoped first then unscoped.
+          fetch_env() {
+            local url="$1"
+            diag "GET $url"
+            curl -sS -H "Authorization: Bearer $VERCEL_TOKEN" "$url"
+          }
+
+          ENV_JSON=""
+          if [ -n "$TEAM_ID" ]; then
+            ENV_JSON=$(fetch_env "https://api.vercel.com/v10/projects/youtube-to-blog/env?teamId=$TEAM_ID&decrypt=true")
+            HAS_ENVS=$(echo "$ENV_JSON" | jq -r '(.envs // []) | length' 2>/dev/null)
+            diag "scoped envs returned: ${HAS_ENVS:-<err>}"
           fi
-          if ! grep -q '^POSTGRES_URL=' .env.e2e; then
-            echo "!! POSTGRES_URL not found in .env.e2e" && exit 1
+          if [ -z "${HAS_ENVS:-}" ] || [ "${HAS_ENVS:-0}" = "0" ]; then
+            ENV_JSON=$(fetch_env "https://api.vercel.com/v10/projects/youtube-to-blog/env?decrypt=true")
+            HAS_ENVS=$(echo "$ENV_JSON" | jq -r '(.envs // []) | length' 2>/dev/null)
+            diag "unscoped envs returned: ${HAS_ENVS:-<err>}"
           fi
+          echo "$ENV_JSON" | jq -r '.error // empty' | tee -a /tmp/diag/pull.log
+
+          # Extract production-scoped env vars into an export script.
+          echo "$ENV_JSON" | jq -r '
+            .envs[]?
+            | select(.target|type=="array" and any(.=="production"))
+            | select(.value != null)
+            | "export \(.key)=\((.value|tostring)|@json)"
+          ' > /tmp/e2e-env.sh
+
+          diag "=== keys loaded (values redacted) ==="
+          grep -oE '^export [A-Z_][A-Z0-9_]*' /tmp/e2e-env.sh | sed 's/^export /- /' \
+            | tee -a /tmp/diag/pull.log
+
+          if ! grep -q '^export POSTGRES_URL=' /tmp/e2e-env.sh; then
+            diag "!! POSTGRES_URL not present in production env"
+            exit 1
+          fi
+          exit 0
 
       - name: Run live AC validation (AC1/AC2/AC3/AC4)
         id: e2e
         env:
-          # Read the .env.e2e via a small bootstrap inside the run: block so
-          # quoted values with special characters survive unchanged.
           DEPLOY_URL: ${{ needs.deploy.outputs.url }}
         run: |
           set -euo pipefail
-          node -e '
-            const fs = require("node:fs");
-            const text = fs.readFileSync(".env.e2e","utf8");
-            const lines = text.split(/\r?\n/);
-            const out = {};
-            for (const line of lines) {
-              const m = line.match(/^([A-Z_][A-Z0-9_]*)=(.*)$/);
-              if (!m) continue;
-              let v = m[2];
-              if (v.startsWith("\"") && v.endsWith("\"")) v = v.slice(1,-1);
-              out[m[1]] = v;
-            }
-            const keep = ["POSTGRES_URL","POSTGRES_PRISMA_URL","POSTGRES_URL_NON_POOLING","TRANSCRIPTAPI_KEY","ANTHROPIC_API_KEY"];
-            const exportLines = Object.entries(out)
-              .filter(([k])=>keep.includes(k))
-              .map(([k,v])=>`export ${k}=${JSON.stringify(v)}`)
-              .join("\n");
-            fs.writeFileSync("/tmp/e2e-env.sh", exportLines+"\n");
-            console.log("exports:", Object.keys(out).filter(k=>keep.includes(k)).join(","));
-          '
           # shellcheck disable=SC1091
           source /tmp/e2e-env.sh
           : "${POSTGRES_URL:?POSTGRES_URL missing after load}"
@@ -217,11 +235,13 @@ jobs:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           OUTCOME="${{ steps.e2e.outcome }}"
+          PULL_OUTCOME="${{ steps.pull_env.outcome }}"
           {
             echo "## Live E2E AC validation"
             echo ""
             echo "- deploy URL: $DEPLOY_URL"
-            echo "- step outcome: \`$OUTCOME\`"
+            echo "- env pull outcome: \`$PULL_OUTCOME\`"
+            echo "- e2e step outcome: \`$OUTCOME\`"
             echo ""
             if [ -f /tmp/e2e-results.md ]; then
               cat /tmp/e2e-results.md
@@ -233,6 +253,13 @@ jobs:
             echo '```'
             tail -c 3500 /tmp/e2e.log 2>/dev/null || echo "(no log)"
             echo '```'
+            if [ -f /tmp/diag/pull.log ]; then
+              echo ""
+              echo "### Env pull diagnostics"
+              echo '```'
+              tail -c 2500 /tmp/diag/pull.log
+              echo '```'
+            fi
             echo ""
             echo "> AC5 (Stripe checkout → plan activated → API key revealed) is not covered by this job; validate it manually in the Stripe dashboard (test mode) before going live."
           } > /tmp/e2e_comment.md
@@ -240,12 +267,10 @@ jobs:
           gh api "repos/${{ github.repository }}/commits/${{ github.sha }}/comments" \
             --input /tmp/e2e_comment.json
 
-      - name: Clean up Vercel link + env file
+      - name: Clean up env export file
         if: always()
-        run: |
-          rm -f .env.e2e
-          rm -rf .vercel
+        run: rm -f /tmp/e2e-env.sh
 
       - name: Fail if E2E failed
-        if: steps.e2e.outcome == 'failure'
+        if: steps.e2e.outcome == 'failure' || steps.pull_env.outcome == 'failure'
         run: exit 1
