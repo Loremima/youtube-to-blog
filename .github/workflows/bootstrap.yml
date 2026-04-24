@@ -1,0 +1,192 @@
+name: Bootstrap external services
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: write
+  actions: write
+
+jobs:
+  bootstrap:
+    runs-on: ubuntu-latest
+    env:
+      VERCEL_TOKEN: ${{ secrets.VERCEL_TOKEN }}
+      TEAM_ID: team_Zl6UUkf7veaJ0FMLrgGawFWh
+      PROJ_ID: prj_d4h9SqWqjS4wQlTBKutgqsaUdahu
+      STRIPE_PRICE_SOLO: price_1TP7PsDwFm4zepPjYWV2TN7B
+      STRIPE_PRICE_CREATOR: price_1TP7QGDwFm4zepPjxpd3uhVW
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Push Stripe price IDs into Vercel env
+        run: |
+          set -e
+          push_env() {
+            local key="$1" value="$2"
+            # Skip if already present.
+            local existing
+            existing=$(curl -sS -H "Authorization: Bearer $VERCEL_TOKEN" \
+              "https://api.vercel.com/v10/projects/$PROJ_ID/env?teamId=$TEAM_ID" \
+              | jq -r --arg k "$key" '.envs[]? | select(.key==$k) | .id' | head -1)
+            if [ -n "$existing" ]; then
+              echo "[$key] already exists ($existing) — patching value"
+              curl -sS -X PATCH -H "Authorization: Bearer $VERCEL_TOKEN" \
+                -H "Content-Type: application/json" \
+                "https://api.vercel.com/v9/projects/$PROJ_ID/env/$existing?teamId=$TEAM_ID" \
+                -d "$(jq -nc --arg v "$value" '{value:$v, target:["production","preview","development"], type:"plain"}')" \
+                | jq -r '.key // .error'
+            else
+              echo "[$key] creating"
+              curl -sS -X POST -H "Authorization: Bearer $VERCEL_TOKEN" \
+                -H "Content-Type: application/json" \
+                "https://api.vercel.com/v10/projects/$PROJ_ID/env?teamId=$TEAM_ID&upsert=true" \
+                -d "$(jq -nc --arg k "$key" --arg v "$value" '{key:$k, value:$v, target:["production","preview","development"], type:"plain"}')" \
+                | jq -r '.key // .error'
+            fi
+          }
+          push_env STRIPE_PRICE_SOLO "$STRIPE_PRICE_SOLO"
+          push_env STRIPE_PRICE_CREATOR "$STRIPE_PRICE_CREATOR"
+
+      - name: Provision Postgres store (Vercel Marketplace / Neon)
+        id: pg
+        run: |
+          set +e
+          mkdir -p /tmp/diag
+          : > /tmp/diag/pg.log
+          log() { echo "$@" | tee -a /tmp/diag/pg.log; }
+
+          existing=$(curl -sS -H "Authorization: Bearer $VERCEL_TOKEN" \
+            "https://api.vercel.com/v1/storage/stores?teamId=$TEAM_ID&projectId=$PROJ_ID" \
+            | jq -r '.stores[]? | select(.type|test("postgres|neon"; "i")) | .id' | head -1)
+          if [ -n "$existing" ]; then
+            log "Postgres store already linked: $existing"
+            echo "store_id=$existing" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          log "Listing available billing plans..."
+          PLANS=$(curl -sS -H "Authorization: Bearer $VERCEL_TOKEN" \
+            "https://api.vercel.com/v1/storage/stores/billing-plans?teamId=$TEAM_ID&type=postgres")
+          echo "$PLANS" | head -c 800 | tee -a /tmp/diag/pg.log
+          echo | tee -a /tmp/diag/pg.log
+
+          # Try several body shapes — the Vercel storage API has shifted across
+          # versions and we want the workflow to keep working as it evolves.
+          ATTEMPTS=(
+            '{"type":"postgres","name":"yt2blog-db","projectId":"'$PROJ_ID'","region":"iad1"}'
+            '{"type":"neon","name":"yt2blog-db","projectId":"'$PROJ_ID'","region":"iad1"}'
+            '{"type":"postgres","name":"yt2blog-db","region":"iad1"}'
+          )
+          STORE_ID=""
+          for body in "${ATTEMPTS[@]}"; do
+            log "POST /v1/storage/stores body=$body"
+            RESP=$(curl -sS -X POST -H "Authorization: Bearer $VERCEL_TOKEN" \
+              -H "Content-Type: application/json" \
+              -d "$body" \
+              "https://api.vercel.com/v1/storage/stores?teamId=$TEAM_ID")
+            log "response: $(echo "$RESP" | head -c 600)"
+            ID=$(echo "$RESP" | jq -r '.id // .store.id // empty')
+            if [ -n "$ID" ]; then
+              STORE_ID="$ID"
+              log "store created: $ID"
+              break
+            fi
+          done
+
+          if [ -z "$STORE_ID" ]; then
+            log "Direct creation failed — trying integration-config path"
+            INTEGRATIONS=$(curl -sS -H "Authorization: Bearer $VERCEL_TOKEN" \
+              "https://api.vercel.com/v1/integrations/configurations?teamId=$TEAM_ID")
+            echo "$INTEGRATIONS" | head -c 800 | tee -a /tmp/diag/pg.log
+            echo | tee -a /tmp/diag/pg.log
+            log "Falling back: bootstrap cannot auto-create the Postgres store on this Vercel API version."
+            echo "store_id=" >> "$GITHUB_OUTPUT"
+            exit 1
+          fi
+
+          log "Connecting store $STORE_ID to project $PROJ_ID"
+          CONN=$(curl -sS -X POST -H "Authorization: Bearer $VERCEL_TOKEN" \
+            -H "Content-Type: application/json" \
+            -d "$(jq -nc --arg p "$PROJ_ID" '{projectId:$p, envVarPrefix:""}')" \
+            "https://api.vercel.com/v1/storage/stores/$STORE_ID/connections?teamId=$TEAM_ID")
+          log "connection response: $(echo "$CONN" | head -c 400)"
+
+          echo "store_id=$STORE_ID" >> "$GITHUB_OUTPUT"
+
+      - name: Pull POSTGRES_URL from project env
+        id: pull
+        if: steps.pg.outputs.store_id != ''
+        run: |
+          set -e
+          # Postgres store provisioning is async — wait briefly.
+          sleep 8
+          ENV_JSON=$(curl -sS -H "Authorization: Bearer $VERCEL_TOKEN" \
+            "https://api.vercel.com/v10/projects/$PROJ_ID/env?teamId=$TEAM_ID&decrypt=true")
+          POSTGRES_URL=$(echo "$ENV_JSON" | jq -r '.envs[]? | select(.key=="POSTGRES_URL") | .value' | head -1)
+          if [ -z "$POSTGRES_URL" ]; then
+            echo "POSTGRES_URL still absent after store creation; the integration may need a manual confirmation step in the dashboard."
+            exit 1
+          fi
+          # Mask in logs by writing only the length.
+          echo "POSTGRES_URL acquired (length=${#POSTGRES_URL})"
+          echo "::add-mask::$POSTGRES_URL"
+          echo "postgres_url=$POSTGRES_URL" >> "$GITHUB_OUTPUT"
+
+      - name: Apply drizzle schema (push mode)
+        if: steps.pull.outputs.postgres_url != ''
+        env:
+          POSTGRES_URL: ${{ steps.pull.outputs.postgres_url }}
+        run: |
+          set -e
+          # `drizzle-kit push` applies the schema directly without generating a
+          # new migration file — perfect for first-boot provisioning.
+          npx drizzle-kit push --force
+
+      - name: Trigger production deploy
+        if: steps.pull.outputs.postgres_url != ''
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gh workflow run "Deploy to Vercel" --repo "${{ github.repository }}" --ref main
+          echo "Triggered Deploy to Vercel workflow."
+
+      - name: Comment summary on commit
+        if: always()
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          STORE_ID="${{ steps.pg.outputs.store_id }}"
+          POSTGRES_OK="${{ steps.pull.outputs.postgres_url != '' }}"
+          {
+            echo "## Bootstrap"
+            echo ""
+            echo "- Stripe prices pushed to env: STRIPE_PRICE_SOLO=$STRIPE_PRICE_SOLO, STRIPE_PRICE_CREATOR=$STRIPE_PRICE_CREATOR"
+            if [ -n "$STORE_ID" ]; then
+              echo "- Postgres store id: \`$STORE_ID\`"
+            else
+              echo "- Postgres store: **not created** (see diagnostics)"
+            fi
+            if [ "$POSTGRES_OK" = "true" ]; then
+              echo "- POSTGRES_URL: present in project env, drizzle schema pushed, redeploy triggered"
+            else
+              echo "- POSTGRES_URL: still absent; the workflow couldn't auto-provision it on this Vercel API version"
+            fi
+            if [ -f /tmp/diag/pg.log ]; then
+              echo ""
+              echo "### Provisioning diagnostics"
+              echo '```'
+              tail -c 2500 /tmp/diag/pg.log
+              echo '```'
+            fi
+          } > /tmp/bootstrap.md
+          jq -Rs '{ body: . }' < /tmp/bootstrap.md > /tmp/bootstrap.json
+          gh api "repos/${{ github.repository }}/commits/${{ github.sha }}/comments" \
+            --input /tmp/bootstrap.json
