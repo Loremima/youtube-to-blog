@@ -42,9 +42,5 @@ export function handleUnknownError(e: unknown): NextResponse {
     return jsonError(e.status >= 500 ? 502 : e.status, `Generation failed: ${e.message}`);
   }
   console.error("unhandled:", e);
-  const debug =
-    e instanceof Error
-      ? `${e.name}: ${e.message}${e.cause ? ` | cause=${String(e.cause).slice(0, 200)}` : ""}`
-      : String(e).slice(0, 300);
-  return jsonError(500, "Internal server error", { debug });
+  return jsonError(500, "Internal server error");
 }

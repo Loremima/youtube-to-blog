@@ -126,7 +126,6 @@ async function main(): Promise<void> {
         html?: string;
         word_count?: number;
         error?: string;
-        debug?: string;
       };
       const html = body.html ?? "";
       const wc = body.word_count ?? 0;
@@ -137,7 +136,7 @@ async function main(): Promise<void> {
           r.status === 200 &&
           wc >= AC1_WORD_COUNT_MIN &&
           elapsedMs < AC1_LATENCY_BUDGET_MS,
-        detail: `status=${r.status} words=${wc} elapsed=${elapsedMs}ms err=${body.error ?? "-"} debug=${body.debug ?? "-"}`,
+        detail: `status=${r.status} words=${wc} elapsed=${elapsedMs}ms err=${body.error ?? "-"}`,
       });
 
       const missing = SECTIONS.filter((s) => !hasSectionH2(html, s));
