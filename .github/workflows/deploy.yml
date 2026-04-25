@@ -155,95 +155,79 @@ jobs:
       - name: Install dependencies
         run: npm ci
 
-      - name: Pull production env from Vercel (REST API)
+      - name: Pull production env from Vercel
         id: pull_env
         run: |
           set +e
           mkdir -p /tmp/diag
           : > /tmp/diag/pull.log
-
           diag() { echo "$@" | tee -a /tmp/diag/pull.log; }
 
-          diag "=== whoami ==="
-          curl -sS -H "Authorization: Bearer $VERCEL_TOKEN" \
-            https://api.vercel.com/v2/user \
-            | jq -r '{username: .user.username, defaultTeamId: .user.defaultTeamId}' \
+          # Marketplace `encrypted` env values are returned as base64 ciphertext
+          # by /v10/projects/{id}/env even with decrypt=true (the API only
+          # decrypts `plain` and `encrypted` v1 envelopes; v2 — used by the
+          # Neon integration — is opaque outside the runtime). The supported
+          # path that decrypts everything is `vercel env pull`, which calls a
+          # different endpoint with the right keys.
+          npm install --global vercel@latest >/dev/null 2>&1
+          vercel --version | tee -a /tmp/diag/pull.log
+
+          mkdir -p .vercel
+          cat > .vercel/project.json <<EOF
+          {"orgId":"team_Zl6UUkf7veaJ0FMLrgGawFWh","projectId":"prj_d4h9SqWqjS4wQlTBKutgqsaUdahu"}
+          EOF
+          diag "wrote .vercel/project.json"
+
+          diag "=== vercel env pull ==="
+          vercel env pull .env.e2e --environment=production --yes --token="$VERCEL_TOKEN" 2>&1 \
             | tee -a /tmp/diag/pull.log
-
-          diag "=== list teams ==="
-          TEAMS_JSON=$(curl -sS -H "Authorization: Bearer $VERCEL_TOKEN" \
-            https://api.vercel.com/v2/teams)
-          echo "$TEAMS_JSON" | jq -r '.teams[]? | "\(.id) \(.slug)"' \
-            | tee -a /tmp/diag/pull.log
-          TEAM_ID=$(echo "$TEAMS_JSON" | jq -r '.teams[]? | select(.slug=="loremimas-projects") | .id' | head -1)
-          diag "resolved team id: ${TEAM_ID:-<personal scope>}"
-
-          # Try the project env endpoint, scoped first then unscoped.
-          fetch_env() {
-            local url="$1"
-            diag "GET $url"
-            curl -sS -H "Authorization: Bearer $VERCEL_TOKEN" "$url"
-          }
-
-          diag "=== resolve project id ==="
-          PROJ_JSON=$(curl -sS -H "Authorization: Bearer $VERCEL_TOKEN" \
-            "https://api.vercel.com/v9/projects/youtube-to-blog?teamId=$TEAM_ID")
-          PROJ_ID=$(echo "$PROJ_JSON" | jq -r '.id // empty')
-          diag "project id: ${PROJ_ID:-<not found>}"
-          if [ -z "$PROJ_ID" ]; then
-            diag "raw project response (first 400):"
-            echo "$PROJ_JSON" | head -c 400 | tee -a /tmp/diag/pull.log
-            echo | tee -a /tmp/diag/pull.log
+          if [ ! -s .env.e2e ]; then
+            diag "!! .env.e2e missing or empty"
+            exit 1
           fi
+          diag "=== .env.e2e keys ==="
+          awk -F= '/^[A-Z_]+=/{print $1}' .env.e2e | tee -a /tmp/diag/pull.log
 
-          ENV_JSON=""
-          HAS_ENVS=""
-          if [ -n "$PROJ_ID" ]; then
-            ENV_JSON=$(curl -sS -H "Authorization: Bearer $VERCEL_TOKEN" \
-              "https://api.vercel.com/v10/projects/$PROJ_ID/env?teamId=$TEAM_ID&decrypt=true")
-            HAS_ENVS=$(echo "$ENV_JSON" | jq -r '(.envs // []) | length' 2>/dev/null)
-            diag "user-defined envs returned: ${HAS_ENVS:-<err>}"
-            diag "--- all keys + targets ---"
-            echo "$ENV_JSON" | jq -r '.envs[]? | "\(.key) [\(.target|join(","))]"' \
-              | tee -a /tmp/diag/pull.log
-          fi
+          # Build /tmp/e2e-env.sh from .env.e2e using a JS parser (handles
+          # quoted values with special characters reliably).
+          node -e '
+            const fs = require("node:fs");
+            const text = fs.readFileSync(".env.e2e","utf8");
+            const out = {};
+            for (const line of text.split(/\r?\n/)) {
+              const m = line.match(/^([A-Z_][A-Z0-9_]*)=(.*)$/);
+              if (!m) continue;
+              let v = m[2];
+              if (v.startsWith("\"") && v.endsWith("\"")) v = v.slice(1,-1);
+              out[m[1]] = v;
+            }
+            const allow = new Set([
+              "POSTGRES_URL","POSTGRES_PRISMA_URL","POSTGRES_URL_NON_POOLING",
+              "POSTGRES_URL_NO_SSL","POSTGRES_DATABASE_URL","POSTGRES_DATABASE_URL_UNPOOLED",
+              "POSTGRES_USER","POSTGRES_HOST","POSTGRES_PASSWORD","POSTGRES_DATABASE",
+              "STRIPE_SECRET_KEY","STRIPE_WEBHOOK_SECRET","STRIPE_PRICE_SOLO","STRIPE_PRICE_CREATOR",
+              "TRANSCRIPTAPI_KEY","ANTHROPIC_API_KEY"
+            ]);
+            const lines = Object.entries(out)
+              .filter(([k]) => allow.has(k))
+              .map(([k,v]) => `export ${k}=${JSON.stringify(v)}`);
+            fs.writeFileSync("/tmp/e2e-env.sh", lines.join("\n")+"\n");
+            console.log("exported keys:", Object.keys(out).filter(k => allow.has(k)).join(","));
+          ' | tee -a /tmp/diag/pull.log
 
-          # Vercel Postgres / Neon integration does not expose POSTGRES_URL via
-          # /projects/{id}/env; it is injected at runtime from a connected store.
-          # Fetch the connection string from /v1/storage/stores.
-          if [ -n "$PROJ_ID" ] && ! echo "$ENV_JSON" | jq -e '.envs[]? | select(.key=="POSTGRES_URL")' >/dev/null 2>&1; then
-            diag "=== resolve connected storage store (POSTGRES_URL integration) ==="
-            STORES_JSON=$(curl -sS -H "Authorization: Bearer $VERCEL_TOKEN" \
-              "https://api.vercel.com/v1/storage/stores?teamId=$TEAM_ID&projectId=$PROJ_ID")
-            diag "stores payload (first 600 chars):"
-            echo "$STORES_JSON" | head -c 600 | tee -a /tmp/diag/pull.log
-            echo | tee -a /tmp/diag/pull.log
-            STORE_ID=$(echo "$STORES_JSON" | jq -r '.stores[]? | select(.type=="postgres" or .type=="neon") | .id' | head -1)
-            diag "store id: ${STORE_ID:-<none>}"
-            if [ -n "$STORE_ID" ]; then
-              STORE_JSON=$(curl -sS -H "Authorization: Bearer $VERCEL_TOKEN" \
-                "https://api.vercel.com/v1/storage/stores/$STORE_ID?teamId=$TEAM_ID")
-              diag "store detail keys:"
-              echo "$STORE_JSON" | jq -r 'keys | join(",")' | tee -a /tmp/diag/pull.log
-              POSTGRES_URL_VALUE=$(echo "$STORE_JSON" | jq -r '
-                .connectionStrings?.postgres_url
-                // .store.connectionStrings?.postgres_url
-                // .urls?.postgres_url
-                // .envs?.POSTGRES_URL
-                // empty
-              ')
-              if [ -n "$POSTGRES_URL_VALUE" ]; then
-                diag "POSTGRES_URL resolved from store (length=${#POSTGRES_URL_VALUE})"
-                # Prepend to the downstream env script; user-defined envs are
-                # appended below.
-                echo "export POSTGRES_URL=$(printf '%s' "$POSTGRES_URL_VALUE" | jq -R .)" > /tmp/e2e-env-store.sh
-              else
-                diag "store did not expose a direct POSTGRES_URL; full payload follows:"
-                echo "$STORE_JSON" | head -c 1200 | tee -a /tmp/diag/pull.log
-                echo | tee -a /tmp/diag/pull.log
-              fi
-            fi
+          if ! grep -q '^export POSTGRES_URL_NON_POOLING=' /tmp/e2e-env.sh && \
+             ! grep -q '^export POSTGRES_URL=' /tmp/e2e-env.sh; then
+            diag "!! No usable POSTGRES_URL in pulled env"
+            exit 1
           fi
+          # Mask all extracted values in CI logs.
+          while read -r line; do
+            v=$(echo "$line" | sed 's/^export [A-Z_][A-Z0-9_]*=//; s/^"//; s/"$//')
+            [ -n "$v" ] && echo "::add-mask::$v"
+          done < /tmp/e2e-env.sh
+          rm -f .env.e2e
+          rm -rf .vercel
+          exit 0
 
           # Build /tmp/e2e-env.sh: POSTGRES_URL from integration store (if any)
           # prepended, followed by user-defined production env vars.
