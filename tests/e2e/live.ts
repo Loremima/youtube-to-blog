@@ -10,7 +10,7 @@
  * validated manually in the Stripe dashboard.
  */
 
-import { sql } from "@vercel/postgres";
+import { createClient } from "@vercel/postgres";
 import { randomBytes, createHash } from "node:crypto";
 import { appendFileSync, writeFileSync } from "node:fs";
 
@@ -62,14 +62,24 @@ async function main(): Promise<void> {
   const profileId = newId("sp");
   const apiKey = generateApiKey();
 
+  // Use createClient so we work with both pooled and direct connection strings.
+  // Prefer POSTGRES_URL_NON_POOLING when present — it is always a direct
+  // connection accepted by createClient — falling back to POSTGRES_URL.
+  const connectionString =
+    process.env.POSTGRES_URL_NON_POOLING ||
+    process.env.POSTGRES_URL ||
+    "";
+  const client = createClient({ connectionString });
+  await client.connect();
+
   console.log(`[seed] user=${userId} email=${testEmail} profile=${profileId}`);
   try {
-    await sql`INSERT INTO users (id, email, plan) VALUES (${userId}, ${testEmail}, 'solo')`;
-    await sql`
+    await client.sql`INSERT INTO users (id, email, plan) VALUES (${userId}, ${testEmail}, 'solo')`;
+    await client.sql`
       INSERT INTO api_keys (id, user_id, key_hash, key_prefix, label)
       VALUES (${keyId}, ${userId}, ${apiKey.hash}, ${apiKey.prefix}, 'e2e')
     `;
-    await sql`
+    await client.sql`
       INSERT INTO style_profiles
         (id, user_id, name, tone, sections_template, cta_text, keywords_seo, target_word_count)
       VALUES
@@ -144,7 +154,7 @@ async function main(): Promise<void> {
       const already = 1;
       const toSeed = SOLO_LIMIT - already;
       for (let i = 0; i < toSeed; i++) {
-        await sql`
+        await client.sql`
           INSERT INTO usage_logs (id, user_id, api_key_id, youtube_url, status)
           VALUES (${newId("log")}, ${userId}, ${keyId}, ${TEST_YOUTUBE_URL}, 'success')
         `;
@@ -171,9 +181,12 @@ async function main(): Promise<void> {
       });
     }
   } finally {
-    await sql`DELETE FROM users WHERE id = ${userId}`.catch((e) => {
+    try {
+      await client.sql`DELETE FROM users WHERE id = ${userId}`;
+    } catch (e) {
       console.error("[cleanup] delete failed:", e);
-    });
+    }
+    await client.end().catch(() => {});
   }
 
   const pass = results.every((r) => r.pass);
