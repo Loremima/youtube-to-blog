@@ -12,7 +12,7 @@ export class TranscriptError extends Error {
 
 const TRANSCRIPT_API_URL =
   process.env.TRANSCRIPTAPI_URL ??
-  "https://api.transcriptapi.com/v1/youtube/transcript";
+  "https://transcriptapi.com/api/v2/youtube/transcript";
 
 interface TranscriptResponse {
   text?: string;
@@ -40,14 +40,17 @@ export async function fetchTranscript(
 
   const videoUrl = normalizeUrl(youtubeUrl);
 
-  const res = await fetch(TRANSCRIPT_API_URL, {
-    method: "POST",
+  const url = new URL(TRANSCRIPT_API_URL);
+  url.searchParams.set("video_url", videoUrl);
+  url.searchParams.set("format", "text");
+  url.searchParams.set("include_timestamp", "false");
+
+  const res = await fetch(url, {
+    method: "GET",
     headers: {
-      "Content-Type": "application/json",
+      Accept: "application/json",
       Authorization: `Bearer ${apiKey}`,
-      "x-api-key": apiKey,
     },
-    body: JSON.stringify({ video_url: videoUrl, format: "text" }),
   });
 
   if (!res.ok) {
