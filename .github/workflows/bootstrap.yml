@@ -72,73 +72,66 @@ jobs:
             exit 0
           fi
 
-          # 1) Inspect what's actually in the project env, including the
-          #    Supabase blobs Lorenzo already wired — they may contain a usable
-          #    connection string.
-          log "=== inspecting supabase_* env values for an embedded connection string ==="
-          ENV_JSON=$(curl -sS -H "Authorization: Bearer $VERCEL_TOKEN" \
-            "https://api.vercel.com/v10/projects/$PROJ_ID/env?teamId=$TEAM_ID&decrypt=true")
-          for key in supabase_secret_keys supabase_public_keys SUPABASE_URL DATABASE_URL; do
-            v=$(echo "$ENV_JSON" | jq -r --arg k "$key" '.envs[]? | select(.key==$k) | .value' | head -1)
-            if [ -n "$v" ]; then
-              log "[$key] length=${#v} first_chars=$(echo -n "$v" | head -c 12)... last_chars=...$(echo -n "$v" | tail -c 8)"
-              # look for postgres connection string shape (postgres://... or postgresql://...)
-              if echo "$v" | grep -qE 'postgres(ql)?://'; then
-                log "[$key] looks like a pg connection string"
-              fi
-            fi
-          done
-
-          # 2) List marketplace integrations on the team — if Supabase or Neon
-          #    is installed, we can create a store via the integration.
           log "=== marketplace integrations (account view) ==="
+          INTS=$(curl -sS -H "Authorization: Bearer $VERCEL_TOKEN" \
+            "https://api.vercel.com/v1/integrations/configurations?teamId=$TEAM_ID&view=account")
+          echo "$INTS" | jq -r '.[]? | "\(.id) \(.slug)"' | tee -a /tmp/diag/pg.log
+          NEON_CFG=$(echo "$INTS" | jq -r '.[]? | select(.slug=="neon") | .id' | head -1)
+          log "neon configuration id: ${NEON_CFG:-<none>}"
+
+          if [ -n "$NEON_CFG" ]; then
+            log "=== neon integration detail ==="
+            curl -sS -H "Authorization: Bearer $VERCEL_TOKEN" \
+              "https://api.vercel.com/v1/integrations/configurations/$NEON_CFG?teamId=$TEAM_ID" \
+              | jq '{id, slug, projects, installType, resources: (.resources // null), connectedProjects: (.connectedProjects // null)}' \
+              | tee -a /tmp/diag/pg.log
+
+            log "=== try resources endpoints ==="
+            for path in \
+              "/v1/integrations/configurations/$NEON_CFG/resources?teamId=$TEAM_ID" \
+              "/v1/integrations/configurations/$NEON_CFG/stores?teamId=$TEAM_ID" \
+              "/v1/storage/stores?teamId=$TEAM_ID&integrationConfigurationId=$NEON_CFG" \
+              "/v9/projects/$PROJ_ID/integrations?teamId=$TEAM_ID"; do
+              log "GET $path"
+              curl -sS -H "Authorization: Bearer $VERCEL_TOKEN" "https://api.vercel.com$path" \
+                | head -c 600 | tee -a /tmp/diag/pg.log
+              echo | tee -a /tmp/diag/pg.log
+            done
+          fi
+
+          log "=== full project env (key list, all targets) ==="
           curl -sS -H "Authorization: Bearer $VERCEL_TOKEN" \
-            "https://api.vercel.com/v1/integrations/configurations?teamId=$TEAM_ID&view=account" \
-            | jq -r '.[]? | "\(.id) \(.slug) \(.type) \(.installType // "-")"' \
+            "https://api.vercel.com/v10/projects/$PROJ_ID/env?teamId=$TEAM_ID" \
+            | jq -r '.envs[]? | "\(.key) [\(.target|join(","))] type=\(.type)"' \
             | tee -a /tmp/diag/pg.log
 
-          log "=== marketplace integrations (project view) ==="
-          curl -sS -H "Authorization: Bearer $VERCEL_TOKEN" \
-            "https://api.vercel.com/v1/integrations/configurations?teamId=$TEAM_ID&projectId=$PROJ_ID&view=project" \
-            | jq -r '.[]? | "\(.id) \(.slug) \(.type) \(.installType // "-")"' \
-            | tee -a /tmp/diag/pg.log
-
-          # 3) Last attempt — drive the Vercel CLI which wraps the modern
-          #    Marketplace flow. With a token + non-interactive flags it can
-          #    sometimes provision Postgres without OAuth.
-          log "=== attempting via Vercel CLI ==="
+          log "=== fallback: Vercel CLI ==="
           npm install --global vercel@latest >/dev/null 2>&1
-          vercel --version | tee -a /tmp/diag/pg.log
-
           mkdir -p .vercel
           cat > .vercel/project.json <<EOF
           {"orgId":"$TEAM_ID","projectId":"$PROJ_ID"}
           EOF
-
-          log "vercel storage --help"
-          vercel storage --help 2>&1 | tee -a /tmp/diag/pg.log | head -40
-
-          log "vercel storage create yt2blog-db (postgres)"
-          # Try multiple syntaxes — different Vercel CLI majors expose different
-          # subcommands.
           for cmd in \
             "vercel storage add postgres --name yt2blog-db --token=$VERCEL_TOKEN --yes" \
-            "vercel storage create postgres yt2blog-db --token=$VERCEL_TOKEN --yes" \
-            "vercel storage create --type postgres --name yt2blog-db --token=$VERCEL_TOKEN --yes"; do
+            "vercel integration list --token=$VERCEL_TOKEN"; do
             log "trying: ${cmd//$VERCEL_TOKEN/<redacted>}"
-            $cmd 2>&1 | tee -a /tmp/diag/pg.log
-            sleep 2
-            existing=$(curl -sS -H "Authorization: Bearer $VERCEL_TOKEN" \
-              "https://api.vercel.com/v1/storage/stores?teamId=$TEAM_ID&projectId=$PROJ_ID" \
-              | jq -r '.stores[]? | select(.type|test("postgres|neon"; "i")) | .id' | head -1)
-            if [ -n "$existing" ]; then
-              log "store now linked: $existing"
-              echo "store_id=$existing" >> "$GITHUB_OUTPUT"
-              exit 0
-            fi
+            $cmd 2>&1 | tee -a /tmp/diag/pg.log | head -20
           done
 
-          log "=== falling back: bootstrap cannot auto-provision on this API surface ==="
+          # Detect ANY pg-style env var that may have been auto-injected by the
+          # integration (POSTGRES_*, STORAGE_*, DATABASE_*).
+          PG_KEY=$(curl -sS -H "Authorization: Bearer $VERCEL_TOKEN" \
+            "https://api.vercel.com/v10/projects/$PROJ_ID/env?teamId=$TEAM_ID" \
+            | jq -r '.envs[]? | .key' \
+            | grep -iE '^(POSTGRES|STORAGE|DATABASE)_URL$' | head -1)
+          if [ -n "$PG_KEY" ]; then
+            log "Detected pg-style env: $PG_KEY"
+            echo "store_id=detected_via_env_$PG_KEY" >> "$GITHUB_OUTPUT"
+            echo "pg_env_key=$PG_KEY" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          log "=== falling back: no Postgres store detected ==="
           echo "store_id=" >> "$GITHUB_OUTPUT"
           exit 1
 
