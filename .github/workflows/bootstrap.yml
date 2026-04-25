@@ -135,24 +135,41 @@ jobs:
           echo "store_id=" >> "$GITHUB_OUTPUT"
           exit 1
 
-      - name: Pull POSTGRES_URL from project env
+      - name: Pull POSTGRES_URL from project env (vercel env pull)
         id: pull
         if: steps.pg.outputs.store_id != ''
         run: |
           set -e
+          # The REST /v10/projects/{id}/env endpoint returns the v2 envelope
+          # ciphertext for Marketplace-managed env vars even with decrypt=true.
+          # Use `vercel env pull` instead — it decrypts everything.
+          mkdir -p .vercel
+          cat > .vercel/project.json <<EOF
+          {"orgId":"$TEAM_ID","projectId":"$PROJ_ID"}
+          EOF
           # Postgres store provisioning is async — wait briefly.
           sleep 8
-          ENV_JSON=$(curl -sS -H "Authorization: Bearer $VERCEL_TOKEN" \
-            "https://api.vercel.com/v10/projects/$PROJ_ID/env?teamId=$TEAM_ID&decrypt=true")
-          POSTGRES_URL=$(echo "$ENV_JSON" | jq -r '.envs[]? | select(.key=="POSTGRES_URL") | .value' | head -1)
-          if [ -z "$POSTGRES_URL" ]; then
-            echo "POSTGRES_URL still absent after store creation; the integration may need a manual confirmation step in the dashboard."
+          vercel env pull .env.bootstrap --environment=production --yes --token="$VERCEL_TOKEN"
+          if [ ! -s .env.bootstrap ]; then
+            echo "vercel env pull produced no file"
             exit 1
           fi
-          # Mask in logs by writing only the length.
+          # Extract POSTGRES_URL plaintext value, strip surrounding quotes.
+          POSTGRES_URL=$(awk -F= '/^POSTGRES_URL=/{
+            sub(/^POSTGRES_URL=/, "");
+            gsub(/^"|"$/, "");
+            print; exit
+          }' .env.bootstrap)
+          if [ -z "$POSTGRES_URL" ]; then
+            echo "POSTGRES_URL not present in pulled env"
+            grep -oE '^[A-Z_]+' .env.bootstrap | head -20
+            exit 1
+          fi
           echo "POSTGRES_URL acquired (length=${#POSTGRES_URL})"
           echo "::add-mask::$POSTGRES_URL"
           echo "postgres_url=$POSTGRES_URL" >> "$GITHUB_OUTPUT"
+          rm -f .env.bootstrap
+          rm -rf .vercel
 
       - name: Apply drizzle schema (push mode)
         if: steps.pull.outputs.postgres_url != ''
@@ -160,9 +177,9 @@ jobs:
           POSTGRES_URL: ${{ steps.pull.outputs.postgres_url }}
         run: |
           set -e
-          # `drizzle-kit push` applies the schema directly without generating a
-          # new migration file — perfect for first-boot provisioning.
-          npx drizzle-kit push --force
+          # `drizzle-kit push` applies the schema directly without generating
+          # a new migration file — perfect for first-boot provisioning.
+          npx drizzle-kit push --force --verbose
 
       - name: Trigger production deploy
         if: steps.pull.outputs.postgres_url != ''
